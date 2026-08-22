@@ -89,7 +89,7 @@ import math
 import pickle
 import re
 from collections import Counter, defaultdict
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from . import format_registry as fr
@@ -706,6 +706,105 @@ def apply_mtp_format_override(
 def _is_mtp_linear(name: str) -> bool:
     """True when `name` refers to an MTP Linear-like quantization target."""
     return str(name).startswith("mtp.")
+
+
+# ---------------------------------------------------------------------------
+# Attention / early-layer role overrides
+# ---------------------------------------------------------------------------
+# Same shape as apply_mtp_format_override / apply_visual_format_override
+# above: force a role-level bucket of Linears to a fixed format regardless of
+# what the value-per-byte knapsack would otherwise pick.
+#
+# Unlike MTP/visual, attention and early-layer Linears are NOT auxiliary —
+# they stay inside the body bpp/Δloss budget the DP solves against. So the
+# functions below (pure assignment-dict transforms, mirroring the MTP/visual
+# API exactly) are applied as a post-DP backstop only; the real enforcement
+# is pinning each targeted Linear's candidate list down to the forced format
+# BEFORE the DP runs (see the call sites in main()). Pinning pre-DP is what
+# keeps `achieved_bits` (computed by the DP solve) reconciled with the final
+# expanded assignment's exact bpp — a post-hoc-only override here would trip
+# the "final expanded assignment payload does not reconcile with the
+# exact-filtered solve" AssertionError near the emit path, because the DP
+# would have priced the body budget without knowing the override was coming.
+_ATTENTION_LINEAR_RE = re.compile(
+    r"^model\.layers\.\d+\.self_attn\.(?P<proj>[^.]+)$"
+)
+_LAYER_INDEX_RE = re.compile(r"^model\.layers\.(?P<idx>\d+)\.")
+
+
+def _attention_projection(name: str) -> str | None:
+    """Return the attention projection leaf (`wq_a`, `wq_b`, `wkv`, `wo_b`
+    for DSV4 MLA; `q_proj`/`k_proj`/`v_proj`/`o_proj` for standard attention)
+    for a `model.layers.<N>.self_attn.<proj>` qname, or None when `name` is
+    not an attention Linear."""
+    m = _ATTENTION_LINEAR_RE.match(str(name))
+    return m.group("proj") if m else None
+
+
+def _layer_index(name: str) -> int | None:
+    """Return the `model.layers.<N>` index for `name`, or None when `name`
+    is not inside a numbered model layer (e.g. mtp.*, model.visual.*,
+    lm_head, embed_tokens)."""
+    m = _LAYER_INDEX_RE.match(str(name))
+    return int(m.group("idx")) if m else None
+
+
+def apply_attention_format_override(
+    assignment: dict[str, str],
+    attn_format: str,
+    *,
+    projections: Iterable[str] | None = None,
+) -> dict[str, str]:
+    """Force attention projection Linears in `assignment` to `attn_format`.
+
+    Attention qnames look like `model.layers.<N>.self_attn.{wq_a,wq_b,wkv,
+    wo_b}`. `projections=None` forces every attention projection; passing
+    e.g. `{"wq_b"}` forces only that projection and leaves whatever the DP
+    chose for the rest untouched — useful for the one tensor a knapsack
+    structurally under-serves without touching its siblings.
+
+    Called after the knapsack DP + fused-sibling promotion, same as
+    `apply_mtp_format_override` / `apply_visual_format_override`. This
+    function does not itself check candidate availability — the caller
+    still has to clear `_validate_assignment_candidate_membership`.
+    """
+    allowed = None if projections is None else set(projections)
+    out = dict(assignment)
+    for name in list(out.keys()):
+        proj = _attention_projection(name)
+        if proj is None:
+            continue
+        if allowed is not None and proj not in allowed:
+            continue
+        out[name] = attn_format
+    return out
+
+
+def apply_early_layer_format_override(
+    assignment: dict[str, str],
+    fmt: str,
+    n_layers: int,
+) -> dict[str, str]:
+    """Force every Linear under `model.layers.<N>` with `N < n_layers` to
+    `fmt` — attention AND MLP/expert projections alike.
+
+    `n_layers=0` (or negative) is a no-op: models with no dense prefix put
+    every layer's experts behind this cutoff, so even `n_layers=1` can cover
+    several GiB — callers are expected to use this sparingly.
+
+    Called after the knapsack DP + fused-sibling promotion, same as
+    `apply_mtp_format_override` / `apply_visual_format_override`. This
+    function does not itself check candidate availability — the caller
+    still has to clear `_validate_assignment_candidate_membership`.
+    """
+    if n_layers <= 0:
+        return dict(assignment)
+    out = dict(assignment)
+    for name in list(out.keys()):
+        idx = _layer_index(name)
+        if idx is not None and idx < n_layers:
+            out[name] = fmt
+    return out
 
 
 def _find_candidate_for_format(
@@ -1919,6 +2018,47 @@ def main():
                     help="Uniform format for MTP Linears. BF16 is the "
                          "production default until MTP speculative-decode "
                          "acceptance is validated for quantized MTP weights.")
+    ap.add_argument("--attn-format",
+                    choices=("",) + _format_cli_choices(),
+                    default="",
+                    help="Force attention projection Linears "
+                         "(`model.layers.<N>.self_attn.*`) to this format, "
+                         "regardless of what the knapsack DP would pick. "
+                         "Unlike --mtp-format/--visual-format this is NOT "
+                         "auxiliary: the forced Linears stay in the body "
+                         "bpp/Δloss budget, enforced by pinning their "
+                         "candidate list before the DP runs. Empty "
+                         "(default) disables the override — attention "
+                         "stays fully DP-chosen. Combine with "
+                         "--attn-projections to target specific "
+                         "projections (e.g. the one tensor the DP "
+                         "structurally under-serves) instead of the whole "
+                         "attention block.")
+    ap.add_argument("--attn-projections", default="",
+                    help="Comma-separated attention projection leaf names "
+                         "(e.g. `wq_b` or `wq_a,wq_b`) that --attn-format "
+                         "applies to. Empty (default) applies to every "
+                         "attention projection. Must be empty when "
+                         "--attn-format is unset.")
+    ap.add_argument("--early-layer-format",
+                    choices=("",) + _format_cli_choices(),
+                    default="",
+                    help="Force every Linear (attention AND MLP/expert) in "
+                         "the first --early-layers layers to this format, "
+                         "regardless of what the knapsack DP would pick. "
+                         "Enforced the same way as --attn-format: pinned "
+                         "before the DP runs, so it stays part of the body "
+                         "budget. Empty (default) disables the override. "
+                         "Must be paired with --early-layers > 0.")
+    ap.add_argument("--early-layers", type=int, default=0,
+                    help="Number of leading `model.layers.<N>` layers "
+                         "(N < this count) that --early-layer-format "
+                         "applies to. 0 (default) disables the override. "
+                         "This model family has no dense prefix, so every "
+                         "layer's experts sit behind this cutoff — even "
+                         "--early-layers=1 can be several GiB. Use "
+                         "sparingly. Must be paired with "
+                         "--early-layer-format.")
     ap.add_argument("--bit-attribution-json", default=None,
                     help="Optional path: write a read-only 'where did the "
                          "budget go' report bucketing the final body "
@@ -2236,6 +2376,33 @@ def main():
     stats = _mark_weight_only_nvfp4_stats(stats, model_profile)
     accounting_stats = dict(stats)
 
+    # Role-level format overrides (attention, early layers). Empty/0 means
+    # "disabled" — no canonicalization, no candidate pinning, no change to
+    # behavior at all, preserving exact backwards compatibility.
+    if args.attn_projections and not args.attn_format:
+        raise SystemExit(
+            "[alloc] ERROR: --attn-projections requires --attn-format "
+            "(nothing to scope it to)."
+        )
+    if bool(args.early_layers) != bool(args.early_layer_format):
+        raise SystemExit(
+            "[alloc] ERROR: --early-layers and --early-layer-format must "
+            "be set together (got --early-layers="
+            f"{args.early_layers}, --early-layer-format="
+            f"{args.early_layer_format!r})."
+        )
+    attn_format_canonical = (
+        fr.get_format(args.attn_format).name if args.attn_format else None
+    )
+    attn_projections = (
+        {p.strip() for p in args.attn_projections.split(",") if p.strip()}
+        if args.attn_projections else None
+    )
+    early_layer_format_canonical = (
+        fr.get_format(args.early_layer_format).name
+        if args.early_layer_format else None
+    )
+
     if args.formats:
         fmt_names = [s.strip() for s in args.formats.split(",") if s.strip()]
     else:
@@ -2249,6 +2416,10 @@ def main():
         fr.get_format(args.mtp_format).name,
         fr.get_format(args.visual_format).name,
     ))
+    if attn_format_canonical is not None:
+        cb_requested_names.append(attn_format_canonical)
+    if early_layer_format_canonical is not None:
+        cb_requested_names.append(early_layer_format_canonical)
     if any(is_cb_format(name) for name in cb_requested_names):
         if (
             args.cb_scale_coding is None
@@ -2421,6 +2592,14 @@ def main():
     rank_specs = {s.name: s for s in specs_sorted}
     rank_specs.setdefault(mtp_format_canonical, fr.get_format(mtp_format_canonical))
     rank_specs.setdefault(visual_format_canonical, fr.get_format(visual_format_canonical))
+    if attn_format_canonical is not None:
+        rank_specs.setdefault(
+            attn_format_canonical, fr.get_format(attn_format_canonical))
+    if early_layer_format_canonical is not None:
+        rank_specs.setdefault(
+            early_layer_format_canonical,
+            fr.get_format(early_layer_format_canonical),
+        )
     rank_specs_sorted, _rank_serialized_rates = _sort_specs_by_serialized_rate(
         list(rank_specs.values()),
         accounting_stats,
@@ -2811,6 +2990,121 @@ def main():
             f"[alloc] --visual-format={visual_format_canonical}: added "
             f"{len(source_only_visual_stats)} source-only visual Linears "
             "to every full Pareto assignment before byte pricing",
+            flush=True,
+        )
+
+    # Attention / early-layer role overrides: PIN the targeted Linears'
+    # candidate list down to a single (forced-format) candidate, BEFORE the
+    # DP runs and BEFORE packed-serving-group aggregation. Unlike MTP/visual
+    # these roles stay inside the body budget — narrowing the candidate menu
+    # (rather than excluding the names from stats/costs/candidates) is what
+    # lets the DP correctly account for their fixed cost while it optimizes
+    # everything else, and it's what keeps the later "final expanded
+    # assignment payload does not reconcile with the exact-filtered solve"
+    # check (which compares the DP's own achieved_bits against the emitted
+    # assignment's exact bpp) honest — a post-hoc-only override applied
+    # after that reconciliation would trip it. Pinning ahead of the packed-
+    # group aggregation below also keeps whole-layer MoE packs atomic: a
+    # forced layer's entire expert pack narrows to one legal format together,
+    # so the group is never split.
+    attn_targets: list[str] = []
+    if attn_format_canonical is not None:
+        attn_target_names = sorted(
+            name for name in stats
+            if (proj := _attention_projection(name)) is not None
+            and (attn_projections is None or proj in attn_projections)
+        )
+        attn_targets = [n for n in attn_target_names if n in candidates]
+        attn_without_candidates = [
+            n for n in attn_target_names if n not in candidates
+        ]
+        if attn_without_candidates:
+            sample = ", ".join(attn_without_candidates[:8])
+            raise SystemExit(
+                f"[alloc] --attn-format={attn_format_canonical} was "
+                f"requested, but {len(attn_without_candidates)} targeted "
+                "attention Linear(s) have no cost candidates at all "
+                "(excluded earlier — profile-pinned, incomplete "
+                f"fused-sibling group, etc.). Sample: {sample}."
+            )
+        missing_attn_format = [
+            n for n in attn_targets
+            if _find_candidate_for_format(
+                candidates, n, attn_format_canonical) is None
+        ]
+        if missing_attn_format:
+            sample = ", ".join(missing_attn_format[:8])
+            raise SystemExit(
+                f"[alloc] --attn-format={attn_format_canonical} has no "
+                f"measured candidate for {len(missing_attn_format)} "
+                f"targeted attention Linear(s). Sample: {sample}. Add "
+                f"{attn_format_canonical} to --formats, or check profile "
+                "legality for these Linears."
+            )
+        for name in attn_targets:
+            candidates[name] = [
+                _find_candidate_for_format(
+                    candidates, name, attn_format_canonical)
+            ]
+        print(
+            f"[alloc] --attn-format={attn_format_canonical}"
+            + (
+                f" --attn-projections={sorted(attn_projections)}"
+                if attn_projections else ""
+            )
+            + f": pinned {len(attn_targets)} attention Linear(s) to a "
+            "single candidate before the DP so the knapsack cannot pick "
+            "anything else",
+            flush=True,
+        )
+
+    early_targets: list[str] = []
+    if early_layer_format_canonical is not None:
+        early_target_names = sorted(
+            name for name in stats
+            if (idx := _layer_index(name)) is not None
+            and idx < args.early_layers
+        )
+        early_targets = [n for n in early_target_names if n in candidates]
+        early_without_candidates = [
+            n for n in early_target_names if n not in candidates
+        ]
+        if early_without_candidates:
+            sample = ", ".join(early_without_candidates[:8])
+            raise SystemExit(
+                f"[alloc] --early-layer-format="
+                f"{early_layer_format_canonical} was requested, but "
+                f"{len(early_without_candidates)} Linear(s) in the first "
+                f"{args.early_layers} layer(s) have no cost candidates at "
+                "all (excluded earlier — profile-pinned, incomplete "
+                f"fused-sibling group, etc.). Sample: {sample}."
+            )
+        missing_early_format = [
+            n for n in early_targets
+            if _find_candidate_for_format(
+                candidates, n, early_layer_format_canonical) is None
+        ]
+        if missing_early_format:
+            sample = ", ".join(missing_early_format[:8])
+            raise SystemExit(
+                f"[alloc] --early-layer-format="
+                f"{early_layer_format_canonical} has no measured candidate "
+                f"for {len(missing_early_format)} Linear(s) in the first "
+                f"{args.early_layers} layer(s). Sample: {sample}. Add "
+                f"{early_layer_format_canonical} to --formats, or check "
+                "profile legality for these Linears."
+            )
+        for name in early_targets:
+            candidates[name] = [
+                _find_candidate_for_format(
+                    candidates, name, early_layer_format_canonical)
+            ]
+        print(
+            f"[alloc] --early-layer-format={early_layer_format_canonical} "
+            f"--early-layers={args.early_layers}: pinned "
+            f"{len(early_targets)} Linear(s) in the first "
+            f"{args.early_layers} layer(s) to a single candidate before "
+            "the DP so the knapsack cannot pick anything else",
             flush=True,
         )
 
@@ -4593,6 +4887,69 @@ def main():
         print(f"[alloc] --visual-format={visual_format}: no visual "
               f"Linears found in source checkpoint — override is a "
               f"no-op", flush=True)
+
+    # Attention / early-layer role overrides: backstop only. Pinning each
+    # targeted Linear's candidate list before the DP (above) already forces
+    # this format; calling apply_*_format_override here should be a no-op by
+    # construction (same shape as promote_serving_units + the
+    # validate_final_serving_promotion_noop check on it above). A drift here
+    # means something downstream of candidate pinning reassigned a pinned
+    # name — fail loudly rather than let a mismatched cb_serialized_identity
+    # slip through.
+    if attn_format_canonical is not None:
+        _attn_before = dict(assignment_expanded)
+        assignment_expanded = apply_attention_format_override(
+            assignment_expanded,
+            attn_format_canonical,
+            projections=attn_projections,
+        )
+        if assignment_expanded != _attn_before:
+            _changed = sorted(
+                n for n in assignment_expanded
+                if _attn_before.get(n) != assignment_expanded[n]
+            )
+            raise AssertionError(
+                "[alloc] ERROR: --attn-format drifted from the pre-DP "
+                f"candidate pin: {len(_changed)} Linear(s) were not "
+                f"already {attn_format_canonical} in the expanded "
+                f"assignment (sample={_changed[:8]}) — something "
+                "downstream of candidate pinning reassigned them."
+            )
+        print(
+            f"[alloc] --attn-format={attn_format_canonical}"
+            + (
+                f" --attn-projections={sorted(attn_projections)}"
+                if attn_projections else ""
+            )
+            + f": confirmed on {len(attn_targets)} attention Linear(s)",
+            flush=True,
+        )
+
+    if early_layer_format_canonical is not None:
+        _early_before = dict(assignment_expanded)
+        assignment_expanded = apply_early_layer_format_override(
+            assignment_expanded,
+            early_layer_format_canonical,
+            args.early_layers,
+        )
+        if assignment_expanded != _early_before:
+            _changed = sorted(
+                n for n in assignment_expanded
+                if _early_before.get(n) != assignment_expanded[n]
+            )
+            raise AssertionError(
+                "[alloc] ERROR: --early-layer-format drifted from the "
+                f"pre-DP candidate pin: {len(_changed)} Linear(s) were not "
+                f"already {early_layer_format_canonical} in the expanded "
+                f"assignment (sample={_changed[:8]}) — something "
+                "downstream of candidate pinning reassigned them."
+            )
+        print(
+            f"[alloc] --early-layer-format={early_layer_format_canonical} "
+            f"--early-layers={args.early_layers}: confirmed on "
+            f"{len(early_targets)} Linear(s)",
+            flush=True,
+        )
 
     _validate_assignment_candidate_membership(
         assignment_expanded,
