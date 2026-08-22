@@ -84,15 +84,21 @@ MANIFEST: dict[str, Any] = {
                 "split": "val",
                 "revision": "4958a03c342fa1bbe9a38fd4bba6e423254f62f5",
                 "streaming": False,
+                # CORRECTED (spark-2): these are the eight languages the
+                # dataset actually contains; the previous European list
+                # overlapped on only eng/dan, silently discarding ~75% of the
+                # corpus and failing the multilingual quota at 22/52 rows.
+                # Also strictly better for a DeepSeek tokenizer: zho/jpn/yue/bod
+                # exercise far more of the 129,280-token vocabulary.
                 "languages": [
                     "eng_Latn",
                     "dan_Latn",
-                    "deu_Latn",
-                    "fra_Latn",
-                    "spa_Latn",
-                    "ita_Latn",
-                    "nld_Latn",
-                    "por_Latn",
+                    "zho_Hans",
+                    "jpn_Jpan",
+                    "yue_Hant",
+                    "bod_Tibt",
+                    "dyu_Latn",
+                    "dik_Latn",
                 ],
             },
         ],
