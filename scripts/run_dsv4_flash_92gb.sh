@@ -207,6 +207,10 @@ DOCKER_COMMON=(
   --rm --gpus all --ipc=host
   -v "${RUN_ROOT}:${RUN_ROOT}"
   -v "${CALIB_DIR}:${CALIB_DIR}:ro"
+  # ADDED (spark-2): MODEL_PATH lives outside RUN_ROOT here (~/models is the
+  # house convention) and DOCKER_COMMON mounted only RUN_ROOT, so the source
+  # was invisible inside the container. Mount it at its own host path.
+  -v "${MODEL_PATH}:${MODEL_PATH}:ro"
   -v "${REPO}:/pq" -w /pq
   -e PYTHONPATH=/pq
   -e PRISMAQUANT_CB_EXT_DIR="${RUN_ROOT}/ext"
@@ -348,6 +352,7 @@ python3 -m prismaquant.incremental_measure_quant_cost \
   --device cuda --dtype bf16 \
   --mode batched --chunk-size 256 \
   --layers-per-shard 1 \
+  --swap-grow-limit-mb 4096 --min-mem-available-mb 8192 \
   --start-layer ${START_LAYER:-0} --end-layer ${END_LAYER:-43} \
   --skip-missing-activations --no-include-lm-head \
   > ${WORK_DIR}/logs/cost.log 2>&1"
@@ -369,7 +374,8 @@ python3 -m prismaquant.allocator \
   --cb-scale-coding two_tier \
   --cb-codebook-source lattice \
   --cb-scale-sweep 1 \
-  --cb-ldlq 0 \
+  --cb-ldlq ${PRISMAQUANT_CB_LDLQ:-0} \
+  --cb-ldlq-scope ${PRISMAQUANT_CB_LDLQ_SCOPE:-none} \
   --cb-encode-tier balanced \
   --cb-col-weights ${WORK_DIR}/artifacts/cb_col_weights.pkl \
   --layer-config ${WORK_DIR}/artifacts/layer_config.json \
@@ -384,7 +390,7 @@ PY"
 }
 
 run_export() {
-  echo "[dsv4] export: ${RUN_ROOT}/artifact-92gb from ${WORK_DIR}/artifacts/layer_config.json"
+  echo "[dsv4] export: ${ARTIFACT_OUT:-${RUN_ROOT}/artifact-92gb} from ${WORK_DIR}/artifacts/layer_config.json"
   # Runs under the SAME DOCKER_COMMON producer identity as cost/alloc
   # (CB_CODEBOOK_SOURCE / CB_SCALE_CODING / CB_SCALE_SWEEP /
   # PRISMAQUANT_CB_ENCODE_TIER), so the render the allocator priced and the
@@ -403,7 +409,7 @@ run_export() {
 python3 -m prismaquant.export_nvfp4_cb_streaming \
   --model-dir ${MODEL_PATH} \
   --layer-config ${WORK_DIR}/artifacts/layer_config.json \
-  --out ${RUN_ROOT}/artifact-92gb \
+  --out ${ARTIFACT_OUT:-${RUN_ROOT}/artifact-92gb} \
   --col-weights ${WORK_DIR}/artifacts/cb_col_weights.pkl \
   --activation-cache-dir ${WORK_DIR}/act \
   --codebook-source lattice \
