@@ -1721,6 +1721,8 @@ def _embed_prefix(base_model: nn.Module, full_path: str) -> str:
 def _layer_attention_type(layer: nn.Module):
     lt = (
         getattr(layer, "layer_type", None)
+        # qwen3_5-class hybrids name it block_type on the decoder layer
+        or getattr(layer, "block_type", None)
         or getattr(getattr(layer, "self_attn", None), "layer_type", None)
         or getattr(getattr(layer, "attention", None), "layer_type", None)
     )
