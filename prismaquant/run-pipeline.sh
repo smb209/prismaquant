@@ -1122,7 +1122,7 @@ if [[ "$BASE_COST_REUSABLE" == "0" ]]; then
     --output "${BASE_COST_PATH}" \
     --work-dir "${WORK_DIR}/work" \
     --device "$DEVICE" --dtype bf16 \
-    --mode batched --chunk-size 256 \
+    --mode batched --chunk-size ${COST_CHUNK_SIZE:-256} \
     --layers-per-shard "$LAYERS_PER_SHARD" \
     --skip-missing-activations \
     --no-include-lm-head \
