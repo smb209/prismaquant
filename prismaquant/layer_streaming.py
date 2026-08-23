@@ -1912,6 +1912,19 @@ def _compute_attention_mask(
     """
     cfg = getattr(base_model, "config", None)
     layer_types = tuple(getattr(cfg, "layer_types", ()) or ())
+    if "linear_attention" in layer_types and "sliding_attention" not in layer_types:
+        # Qwen3.5/3.8-class hybrids: GDN/delta-net mixers take the 2D
+        # padding mask (apply_mask_to_padding_states multiplies
+        # mask[:, :, None] onto [B, S, H]); handing them the 4D causal
+        # mask broadcasts into a 5-dim shape error. Calibration rows are
+        # fixed-length and unpadded, so None is the correct mask for the
+        # linear layers; attention layers keep the causal mask via the
+        # per-type dict that _call_layer already resolves.
+        return {
+            "full_attention": _make_causal_mask(
+                hidden.size(1), hidden.device, hidden.dtype),
+            "linear_attention": None,
+        }
     if cfg is None or "sliding_attention" not in layer_types:
         return _make_causal_mask(hidden.size(1), hidden.device, hidden.dtype)
 
