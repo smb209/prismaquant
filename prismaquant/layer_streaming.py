@@ -1912,6 +1912,11 @@ def _compute_attention_mask(
     """
     cfg = getattr(base_model, "config", None)
     layer_types = tuple(getattr(cfg, "layer_types", ()) or ())
+    if not layer_types:
+        # Multimodal wrappers (qwen3_5 et al.) keep the hybrid schedule on
+        # the nested text_config, not the top-level config.
+        tcfg = getattr(cfg, "text_config", None)
+        layer_types = tuple(getattr(tcfg, "layer_types", ()) or ())
     if "linear_attention" in layer_types and "sliding_attention" not in layer_types:
         # Qwen3.5/3.8-class hybrids: GDN/delta-net mixers take the 2D
         # padding mask (apply_mask_to_padding_states multiplies
