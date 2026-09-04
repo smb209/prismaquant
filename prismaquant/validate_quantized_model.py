@@ -171,13 +171,15 @@ DEFAULT_MIN_MTP_ACCEPT_P0 = 0.60       # position-0 accept fraction
 # this stratum (official unquantized 0/60 terse, fixed quant 0/60). Sampling
 # temperature 1.0 is the unmodified distribution — any temperature > 0 leaves
 # the argmax path and exposes the near-tie; 1.0 adds no tuning. `MAX_TOKENS`
-# 64 is far above what these prompts need, so `length` means runaway/loop.
-# `REPS` 6 is the published battery's own replication count (30 prompts × 6
-# reps main + 24 reps × 5 numeric stackext): 5 prompts × 6 reps = 30 sampled
-# generations, minutes of serve time.
+# must fit a full thinking trace + answer: a reasoning model routinely spends
+# far more than 64 tokens deliberating even on "144÷12" (measured: a healthy
+# DSV4-Flash quant hit 7/30 cap-truncation at 64 tokens under the chat template,
+# 0/30 at 600), so `length` means runaway/loop only once the cap clears the trace.
+# `REPS` 6 is the published battery's own replication count (30 prompts × 6 reps
+# main + 24 × 5 numeric stackext): 5 prompts × 6 reps = 30 sampled generations.
 DEFAULT_MAX_BOUNDARY_DEFECTS = 0
 DEFAULT_BOUNDARY_TEMPERATURE = 1.0
-DEFAULT_BOUNDARY_MAX_TOKENS = 64
+DEFAULT_BOUNDARY_MAX_TOKENS = 640
 DEFAULT_BOUNDARY_REPS = 6
 
 
@@ -385,6 +387,30 @@ def score_boundary_text(
     return {"think_tag_count": count, "defects": defects}
 
 
+def chat_template_renderer(artifact_dir: str, **template_kwargs):
+    """Build a ``str -> str`` renderer that wraps a bare prompt in the model's
+    chat template (loaded from ``artifact_dir``), so a thinking model enters
+    reasoning mode on the raw ``/v1/completions`` endpoint.
+
+    ``template_kwargs`` pass through to ``apply_chat_template`` — some models
+    gate the think block behind a flag (DSV4-Flash: ``thinking=True``; Qwen3:
+    ``enable_thinking=True``, the default). Loads only the tokenizer, not the
+    weights, so the check stays cheap. Returns ``None`` if ``artifact_dir`` is
+    falsy so the caller can fall back to raw prompts.
+    """
+    if not artifact_dir:
+        return None
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(artifact_dir, trust_remote_code=True)
+
+    def render(prompt: str) -> str:
+        return tok.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False, add_generation_prompt=True, **template_kwargs,
+        )
+    return render
+
+
 def check_boundary_behavior(
     base_url: str,
     model_name: str,
@@ -394,15 +420,25 @@ def check_boundary_behavior(
     max_tokens: int = DEFAULT_BOUNDARY_MAX_TOKENS,
     reps: int = DEFAULT_BOUNDARY_REPS,
     prompts: tuple[str, ...] | list[str] = BOUNDARY_PROMPTS,
+    render=None,
 ) -> CheckResult:
     """Sample boundary-stressing prompts and score `</think>` behavior.
 
     Each prompt is sampled `reps` times at `temperature > 0` (sampling, not
-    the argmax path greedy-smoke takes) with a small `max_tokens` cap, and
-    every generation is scored by :func:`score_boundary_text`. Fails when
-    total defects exceed `max_defects` (default 0: any stutter, zero-tag
-    runaway, or cap-truncation on these terse prompts is a functional
-    failure). Runs alongside KL/PPL, not replacing them.
+    the argmax path greedy-smoke takes) and every generation is scored by
+    :func:`score_boundary_text`. Fails when total defects exceed `max_defects`
+    (default 0: any stutter, zero-tag runaway, or cap-truncation on these terse
+    prompts is a functional failure). Runs alongside KL/PPL, not replacing them.
+
+    `render` is an optional ``str -> str`` callable that wraps the bare prompt
+    in the model's chat template (see :func:`chat_template_renderer`). It is
+    REQUIRED for a thinking model: the raw ``/v1/completions`` endpoint never
+    applies a chat template, so an unwrapped terse prompt is document-continued
+    rather than answered — the model never enters reasoning mode, never emits
+    `</think>`, and the check fails every artifact. With the template applied
+    (and `skip_special_tokens=False` so the tag survives), a healthy artifact
+    files zero. When `render is None` the prompt is sent raw (only correct for a
+    non-thinking model that emits the delimiter without a scaffold).
     """
     if not temperature or temperature <= 0:
         return CheckResult(
@@ -416,15 +452,20 @@ def check_boundary_behavior(
     failing_examples: list[dict] = []
     n_generations = 0
     for prompt in prompts:
+        served_prompt = render(prompt) if render is not None else prompt
         for _rep in range(reps):
             try:
                 r = _post_json(
                     f"{base_url}/v1/completions",
                     {
                         "model": model_name,
-                        "prompt": prompt,
+                        "prompt": served_prompt,
                         "max_tokens": max_tokens,
                         "temperature": temperature,
+                        # keep `</think>` in the raw text for the scorer; the
+                        # chat template renders special tokens that vLLM would
+                        # otherwise strip from the completion.
+                        "skip_special_tokens": False,
                     },
                 )
                 choice = r["choices"][0]
@@ -666,6 +707,7 @@ def run_validation(
     wait_seconds: float = 900.0,
     bos_token: str | None = None,
     add_special_tokens: bool = True,
+    boundary_render=None,
 ) -> ValidationReport:
     # `base_url` is the SERVER root, not the OpenAI API root: this module
     # appends `/v1/completions` itself and reads `/health` and `/metrics` off
@@ -712,6 +754,7 @@ def run_validation(
         temperature=boundary_temperature,
         max_tokens=boundary_max_tokens,
         reps=boundary_reps,
+        render=boundary_render,
     ))
     rep.checks.append(check_perplexity(
         base_url, model_name,
@@ -850,6 +893,14 @@ def main() -> int:
     ap.add_argument("--boundary-reps", type=int,
                     default=DEFAULT_BOUNDARY_REPS,
                     help="Sampled repetitions per boundary prompt")
+    ap.add_argument("--boundary-raw", action="store_true", default=False,
+                    help="Send boundary prompts raw (no chat template). Only "
+                         "correct for a non-thinking model; a thinking model "
+                         "needs the template (the default) to emit </think>.")
+    ap.add_argument("--boundary-template-kwargs", default="{}",
+                    help="JSON kwargs passed to apply_chat_template for the "
+                         "boundary check, e.g. '{\"thinking\": true}' "
+                         "(DSV4-Flash) or '{\"enable_thinking\": true}' (Qwen3).")
     ap.add_argument("--bos-token", default=None,
                     help="Optional literal BOS string to prepend before "
                          "perplexity prompts for BOS-sensitive tokenizers "
@@ -875,6 +926,21 @@ def main() -> int:
                          "the shipcard's own model_dir.")
     args = ap.parse_args()
 
+    # Build the boundary renderer from the served model's chat template so a
+    # thinking model actually enters reasoning mode (the raw /v1/completions
+    # endpoint never applies a template). --boundary-raw opts out.
+    boundary_render = None
+    if not args.boundary_raw:
+        tmpl_dir = args.artifact_dir or (
+            args.model_name if os.path.isdir(args.model_name) else None)
+        if tmpl_dir:
+            tmpl_kwargs = json.loads(args.boundary_template_kwargs or "{}")
+            boundary_render = chat_template_renderer(tmpl_dir, **tmpl_kwargs)
+        else:
+            print("WARNING: boundary check has no artifact dir for the chat "
+                  "template (pass --artifact-dir); sending prompts RAW — a "
+                  "thinking model will fail every generation.", file=sys.stderr)
+
     rep = run_validation(
         args.base_url, args.model_name,
         max_ppl=args.max_ppl,
@@ -889,6 +955,7 @@ def main() -> int:
         wait_seconds=args.wait_seconds,
         bos_token=args.bos_token,
         add_special_tokens=args.add_special_tokens,
+        boundary_render=boundary_render,
     )
     md = format_report_md(rep)
     print(md)
